@@ -1,0 +1,154 @@
+#include "config.h"
+#include "system_config.h"
+
+#include <MozziConfigValues.h>
+#define MOZZI_AUDIO_CHANNELS MOZZI_STEREO
+#include <MozziGuts.h>
+#include <LowPassFilter.h>
+#include <mozzi_rand.h>
+#include <mozzi_midi.h>
+#include <Smooth.h>
+
+#include "wavetables.h"
+
+// Timing is measured in Mozzi control updates.
+const uint16_t STARTUP_TICKS = CONTROL_RATE * 3;
+const uint16_t ALARM_TICKS = CONTROL_RATE * 5;
+const uint16_t CLEAR_TICKS = CONTROL_RATE / 2;
+const uint8_t DETECT_TICKS = 3;
+
+// The original sketch treats LOW as object detected.
+const uint8_t DETECTED_LEVEL = LOW;
+
+uint16_t startupRemaining = STARTUP_TICKS;
+uint16_t alarmRemaining = 0;
+uint16_t clearCount = 0;
+uint8_t detectCount = 0;
+
+bool armed = false;
+uint8_t alarmVolume = 0;
+
+void setup() {
+  pinMode(PROX_PIN, INPUT);
+
+  aSin1.setFreq(700.0f);
+
+  startMozzi(CONTROL_RATE);
+}
+
+void updateControl() {
+  bool detected =
+      (digitalRead(PROX_PIN) == DETECTED_LEVEL);
+
+  int knob = mozziAnalogRead<ADC_RESOLUTION>(POT_PIN3);
+
+  uint8_t selectedVolume = (uint8_t)map(
+      knob,
+      0,
+      ADC_MAX_VALUE,
+      0,
+      MASTER_GAIN_MAX
+  );
+
+  // Stay quiet for three seconds after power-up.
+  if (startupRemaining > 0) {
+    startupRemaining--;
+    alarmVolume = 0;
+    armed = false;
+    clearCount = 0;
+    detectCount = 0;
+    return;
+  }
+
+  // Run the siren for five seconds.
+  if (alarmRemaining > 0) {
+    uint16_t elapsed = ALARM_TICKS - alarmRemaining;
+
+    // Sweep up and down once each second.
+    uint16_t phase = elapsed % CONTROL_RATE;
+    uint16_t halfCycle = CONTROL_RATE / 2;
+
+    uint16_t ramp;
+    if (phase < halfCycle) {
+      ramp = phase;
+    } else {
+      ramp = CONTROL_RATE - phase;
+    }
+
+    float sirenFrequency =
+        700.0f + (700.0f * ramp / halfCycle);
+
+    aSin1.setFreq(sirenFrequency);
+
+    // Smooth volume changes.
+    if (alarmVolume < selectedVolume) {
+      alarmVolume++;
+    } else if (alarmVolume > selectedVolume) {
+      alarmVolume--;
+    }
+
+    alarmRemaining--;
+
+    if (alarmRemaining == 0) {
+      armed = false;
+      clearCount = 0;
+      detectCount = 0;
+    }
+
+    return;
+  }
+
+  // Fade out after the alarm.
+  if (alarmVolume > 0) {
+    alarmVolume--;
+  }
+
+  // Require a clear sensor for half a second
+  // before arming or rearming.
+  if (!armed) {
+    if (!detected) {
+      if (clearCount < CLEAR_TICKS) {
+        clearCount++;
+      }
+
+      if (clearCount >= CLEAR_TICKS) {
+        armed = true;
+        detectCount = 0;
+      }
+    } else {
+      clearCount = 0;
+    }
+
+    return;
+  }
+
+  // Several consecutive detections reject brief glitches.
+  if (detected) {
+    if (detectCount < DETECT_TICKS) {
+      detectCount++;
+    }
+
+    if (detectCount >= DETECT_TICKS) {
+      alarmRemaining = ALARM_TICKS;
+      armed = false;
+      detectCount = 0;
+      clearCount = 0;
+    }
+  } else {
+    detectCount = 0;
+  }
+}
+
+AudioOutput_t updateAudio() {
+  long sample = (long)aSin1.next() * alarmVolume;
+
+  return StereoOutput::fromAlmostNBit(
+      AUDIO_OUTPUT_BITS,
+      sample,
+      sample
+  ).clip();
+}
+
+void loop() {
+  audioHook();
+}
